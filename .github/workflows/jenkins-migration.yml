@@ -1,0 +1,211 @@
+name: Jenkins Migration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mulesoft-root:
+    name: Root MuleSoft deployment
+    runs-on: ubuntu-latest
+    env:
+      ANYPOINT_USERNAME: ${{ secrets.ANYPOINT_USERNAME }}
+      ANYPOINT_PASSWORD: ${{ secrets.ANYPOINT_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Unit Test
+        run: |
+          echo "Running Unit Tests..."
+          mvn clean test
+      - name: Deploy Standalone
+        run: |
+          echo "Deploying in Standalone mode..."
+          mvn deploy -P standalone
+      - name: Deploy to AnyPoint
+        run: |
+          echo "Deploying to Anypoint Platform..."
+          mvn deploy -P arm \
+            -Darm.target.name=local-4.0.0-ee \
+            -Danypoint.username="${ANYPOINT_USERNAME}" \
+            -Danypoint.password="${ANYPOINT_PASSWORD}"
+      - name: Deploy to CloudHub
+        run: |
+          echo "Deploying to CloudHub..."
+          mvn deploy -P cloudhub \
+            -Dmule.version=4.0.0 \
+            -Danypoint.username="${ANYPOINT_USERNAME}" \
+            -Danypoint.password="${ANYPOINT_PASSWORD}"
+      - name: Report deployment success
+        if: ${{ success() }}
+        run: echo "✅ Deployment completed successfully!"
+      - name: Report deployment failure
+        if: ${{ failure() }}
+        run: echo "❌ Deployment failed! Check logs for errors."
+
+  docker-maven:
+    name: Docker Maven build
+    runs-on: ubuntu-latest
+    container:
+      image: maven:3.5.0-jdk-8
+      options: --volume /tmp:/tmp --publish 8000:8000
+    env:
+      MAVEN_OPTS: -Xmx2048m
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build
+        working-directory: dockermaven
+        run: |
+          mvn --version
+          java -version
+          mvn clean compile
+      - name: Test
+        working-directory: dockermaven
+        run: mvn test
+      - name: Upload test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docker-maven-surefire-reports
+          path: dockermaven/target/surefire-reports/*.xml
+          if-no-files-found: ignore
+      - name: Package
+        working-directory: dockermaven
+        run: mvn package -DskipTests
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docker-maven-packages
+          path: dockermaven/target/*.jar
+          if-no-files-found: ignore
+
+  maven-docker-parallel-build:
+    name: Maven Docker parallel build
+    runs-on: ubuntu-latest
+    container:
+      image: maven:3.5.0-jdk-8
+    outputs:
+      image: ${{ steps.metadata.outputs.image }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read Maven project metadata
+        id: metadata
+        working-directory: mavendockerparallel
+        run: |
+          image=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Build
+        working-directory: mavendockerparallel
+        run: mvn clean findbugs:findbugs package
+      - name: Upload package artifacts
+        if: ${{ success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: maven-docker-parallel-packages
+          path: mavendockerparallel/**/target/*.jar
+          if-no-files-found: ignore
+
+  maven-docker-integration-test:
+    name: Maven Docker integration test
+    runs-on: ubuntu-latest
+    needs: maven-docker-parallel-build
+    steps:
+      - name: Integration Test
+        run: echo 'Run integration tests here...'
+
+  maven-docker-sonar-scan:
+    name: Maven Docker Sonar scan
+    runs-on: ubuntu-latest
+    needs: maven-docker-parallel-build
+    container:
+      image: maven:3.5.0-jdk-8
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Sonar Scan
+        working-directory: mavendockerparallel
+        run: mvn sonar:sonar -Dsonar.login="${SONAR_TOKEN}"
+
+  maven-docker-publish-image:
+    name: Maven Docker publish image
+    runs-on: ubuntu-latest
+    needs:
+      - maven-docker-parallel-build
+      - maven-docker-integration-test
+      - maven-docker-sonar-scan
+    if: ${{ github.ref_name == 'master' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and Publish Image
+        working-directory: mavendockerparallel
+        env:
+          IMAGE: ${{ needs.maven-docker-parallel-build.outputs.image }}
+          VERSION: ${{ needs.maven-docker-parallel-build.outputs.version }}
+        run: |
+          docker build -t "${IMAGE}" .
+          docker tag "${IMAGE}" "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:${VERSION}"
+
+  mulesoft-anypoint:
+    name: MuleSoft AnyPoint deployment
+    runs-on: ubuntu-latest
+    env:
+      ANYPOINT_USERNAME: ${{ secrets.ANYPOINT_USERNAME }}
+      ANYPOINT_PASSWORD: ${{ secrets.ANYPOINT_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Unit Test
+        working-directory: mulesoftanypoint
+        run: |
+          echo "Running Unit Tests..."
+          mvn clean test
+      - name: Deploy Standalone
+        working-directory: mulesoftanypoint
+        run: |
+          echo "Deploying in Standalone mode..."
+          mvn deploy -P standalone
+      - name: Deploy to AnyPoint
+        working-directory: mulesoftanypoint
+        run: |
+          echo "Deploying to Anypoint Platform..."
+          mvn deploy -P arm \
+            -Darm.target.name=local-4.0.0-ee \
+            -Danypoint.username="${ANYPOINT_USERNAME}" \
+            -Danypoint.password="${ANYPOINT_PASSWORD}"
+      - name: Deploy to CloudHub
+        working-directory: mulesoftanypoint
+        run: |
+          echo "Deploying to CloudHub..."
+          mvn deploy -P cloudhub \
+            -Dmule.version=4.0.0 \
+            -Danypoint.username="${ANYPOINT_USERNAME}" \
+            -Danypoint.password="${ANYPOINT_PASSWORD}"
+      - name: Report deployment success
+        if: ${{ success() }}
+        run: echo "✅ Deployment completed successfully!"
+      - name: Report deployment failure
+        if: ${{ failure() }}
+        run: echo "❌ Deployment failed! Check logs for errors."
